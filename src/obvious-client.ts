@@ -11,6 +11,15 @@
 
 import { sanitizeName } from './installer.ts';
 
+/** Timeout for individual HTTP fetches (ms) — mirrors src/blob.ts's bound. */
+const FETCH_TIMEOUT = 10_000;
+
+/** Optional per-call knobs; tests override to exercise the timeout path quickly. */
+export interface SkillCallOptions {
+  /** Abort a request that takes longer than this. Defaults to FETCH_TIMEOUT. */
+  timeoutMs?: number;
+}
+
 export interface PublishPayload {
   /** Full original SKILL.md, frontmatter + body, from parseSkillMd's rawContent. */
   content: string;
@@ -59,9 +68,10 @@ export class ObviousApiError extends Error {
  */
 export async function listWorkspaceSkills(
   token: string,
-  baseUrl: string
+  baseUrl: string,
+  options: SkillCallOptions = {}
 ): Promise<Map<string, WorkspaceSkillRef>> {
-  const { body } = await request(token, baseUrl, 'GET', '/sdk/skills/list');
+  const { body } = await request(token, baseUrl, 'GET', '/sdk/skills/list', undefined, options);
   const byName = new Map<string, WorkspaceSkillRef>();
   for (const item of Array.isArray(body.items) ? body.items : []) {
     if (!isRecord(item) || typeof item.skillId !== 'string' || typeof item.name !== 'string')
@@ -80,9 +90,17 @@ export async function listWorkspaceSkills(
 export async function createSkill(
   token: string,
   baseUrl: string,
-  payload: PublishPayload
+  payload: PublishPayload,
+  options: SkillCallOptions = {}
 ): Promise<CreateUpdateResult> {
-  const { status, body } = await request(token, baseUrl, 'POST', '/sdk/skills/create', payload);
+  const { status, body } = await request(
+    token,
+    baseUrl,
+    'POST',
+    '/sdk/skills/create',
+    payload,
+    options
+  );
   return requireSkillId(status, body);
 }
 
@@ -91,12 +109,20 @@ export async function updateSkill(
   token: string,
   baseUrl: string,
   skillId: string,
-  payload: PublishPayload
+  payload: PublishPayload,
+  options: SkillCallOptions = {}
 ): Promise<CreateUpdateResult> {
-  const { status, body } = await request(token, baseUrl, 'POST', '/sdk/skills/update', {
-    ...payload,
-    skillId,
-  });
+  const { status, body } = await request(
+    token,
+    baseUrl,
+    'POST',
+    '/sdk/skills/update',
+    {
+      ...payload,
+      skillId,
+    },
+    options
+  );
   return requireSkillId(status, body);
 }
 
@@ -112,12 +138,14 @@ async function request(
   baseUrl: string,
   method: 'GET' | 'POST',
   path: string,
-  payload?: unknown
+  payload?: unknown,
+  { timeoutMs = FETCH_TIMEOUT }: SkillCallOptions = {}
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   let response: Response;
   try {
     response = await fetch(`${baseUrl}${path}`, {
       method,
+      signal: AbortSignal.timeout(timeoutMs),
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
@@ -126,19 +154,44 @@ async function request(
       ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
     });
   } catch (err) {
+    const errName = (err as Error).name;
+    if (errName === 'TimeoutError' || errName === 'AbortError') {
+      throw new ObviousApiError(0, `request to ${path} timed out after ${timeoutMs}ms`);
+    }
     throw new ObviousApiError(0, `request to ${path} failed: ${(err as Error).message}`);
   }
 
-  if (response.status === 401) throw new TokenExpiredError(response.statusText || 'unauthorized');
+  // Prefer a JSON error body's `error` field (quota/validation detail) over statusText.
+  const fallbackMessage = response.ok ? null : await describeFailure(response);
+  if (response.status === 401) throw new TokenExpiredError(fallbackMessage ?? 'unauthorized');
 
-  if (!response.ok)
-    throw new ObviousApiError(response.status, response.statusText || 'request failed');
+  if (!response.ok) throw new ObviousApiError(response.status, fallbackMessage ?? 'request failed');
 
   const text = await response.text();
   if (!text) return { status: response.status, body: {} };
-  const parsed: unknown = JSON.parse(text);
+  // A malformed 2xx body must not escape the typed error contract as a raw SyntaxError.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new ObviousApiError(response.status, 'invalid JSON in response body');
+  }
   if (!isRecord(parsed)) return { status: response.status, body: {} };
   return { status: response.status, body: parsed };
+}
+
+/** Reads a non-OK response's JSON error body; falls back to statusText when absent. */
+async function describeFailure(response: Response): Promise<string> {
+  const fallback = response.statusText || 'request failed';
+  if (!response.headers.get('content-type')?.includes('application/json')) return fallback;
+  try {
+    const body = await response.text();
+    const parsed: unknown = body ? JSON.parse(body) : undefined;
+    if (isRecord(parsed) && typeof parsed.error === 'string') return parsed.error;
+  } catch {
+    // Unreadable/unparseable error body — statusText is the honest fallback.
+  }
+  return fallback;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

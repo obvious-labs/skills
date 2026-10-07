@@ -170,12 +170,16 @@ describe('obvious-client', () => {
     [403, '/sdk/skills/create'],
     [404, '/sdk/skills/list'],
     [409, '/sdk/skills/create'],
-  ] as const)('maps HTTP %i to ObviousApiError with status and message', async (status, route) => {
+    [422, '/sdk/skills/update'],
+  ] as const)('maps HTTP %i to ObviousApiError across client calls', async (status, route) => {
     respondJson(status, { error: `bad request ${status}` });
 
     let caught: unknown;
     try {
+      // Route each row to the client function that actually hits that route.
       if (route === '/sdk/skills/list') await listWorkspaceSkills(TOKEN, baseUrl);
+      else if (route === '/sdk/skills/update')
+        await updateSkill(TOKEN, baseUrl, 'skl_x', SAMPLE_PAYLOAD);
       else await createSkill(TOKEN, baseUrl, SAMPLE_PAYLOAD);
     } catch (err) {
       caught = err;
@@ -213,6 +217,42 @@ describe('obvious-client', () => {
     await expect(updateSkill(TOKEN, baseUrl, 'skl_x', SAMPLE_PAYLOAD)).rejects.toMatchObject({
       name: 'ObviousApiError',
       message: 'response missing skillId',
+    });
+  });
+
+  it('maps a hung request to ObviousApiError via the fetch timeout', async () => {
+    handler = () => {
+      // Never respond; the client's own timeout must abort.
+    };
+    await expect(
+      createSkill(TOKEN, baseUrl, SAMPLE_PAYLOAD, { timeoutMs: 50 })
+    ).rejects.toMatchObject({
+      name: 'ObviousApiError',
+      status: 0,
+      message: expect.stringContaining('timed out after 50ms'),
+    });
+  }, 2000);
+
+  it('prefers a JSON error body message over statusText on failure', async () => {
+    respondJson(429, { error: 'rate limit exceeded, retry after 30s' });
+
+    await expect(createSkill(TOKEN, baseUrl, SAMPLE_PAYLOAD)).rejects.toMatchObject({
+      name: 'ObviousApiError',
+      status: 429,
+      message: 'rate limit exceeded, retry after 30s',
+    });
+    await expect(updateSkill(TOKEN, baseUrl, 'skl_x', SAMPLE_PAYLOAD)).rejects.not.toBeInstanceOf(
+      TokenExpiredError
+    );
+  });
+
+  it('maps a 2xx with a malformed JSON body to a typed failure, not a SyntaxError', async () => {
+    respondRaw(200, '<html>gateway error</html>');
+
+    await expect(createSkill(TOKEN, baseUrl, SAMPLE_PAYLOAD)).rejects.toMatchObject({
+      name: 'ObviousApiError',
+      status: 200,
+      message: 'invalid JSON in response body',
     });
   });
 });
