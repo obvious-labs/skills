@@ -57,6 +57,11 @@ npx skills add git@github.com:vercel-labs/agent-skills.git
 npx skills add ./my-local-skills
 ```
 
+```bash
+# Publish skills in the current directory to an Obvious workspace
+npx skills publish --to obvious
+```
+
 ### Private Repositories
 
 Use the same command for public and private repositories. The CLI uses the authentication already configured for the repository URL:
@@ -150,6 +155,7 @@ When installing interactively, you can choose:
 | `npx skills find [query]`    | Search for skills interactively or by keyword |
 | `npx skills remove [skills]` | Remove installed skills from agents           |
 | `npx skills update [skills]` | Update installed skills to latest versions    |
+| `npx skills publish <path>`  | Publish local skills to an Obvious workspace  |
 | `npx skills init [name]`     | Create a new SKILL.md template                |
 
 ### `skills list`
@@ -259,6 +265,89 @@ npx skills rm my-skill
 | `-s, --skill`  | Specify skills to remove (use `'*'` for all)     |
 | `-y, --yes`    | Skip confirmation prompts                        |
 | `--all`        | Shorthand for `--skill '*' --agent '*' -y`       |
+
+## Publishing to Obvious
+
+Push local skills from your filesystem into an Obvious workspace. Publish is one-way: it creates a workspace skill
+for each discovered `SKILL.md`, or updates the existing workspace skill when the frontmatter `name` matches.
+It never deletes workspace skills and never pulls Obvious content back to disk.
+
+### Syntax
+
+```bash
+npx skills publish [path] --to obvious
+```
+
+`[path]` is optional and defaults to the current directory. If the path contains a `SKILL.md` at its root, only that
+skill is published. Otherwise the path is treated as a tree and every `SKILL.md` under it is discovered,
+deduplicated by normalized name.
+
+### Options
+
+| Option                | Description                                                                                    |
+| --------------------- | ---------------------------------------------------------------------------------------------- |
+| `--to <target>`       | Publication target. `obvious` is the only supported target today                               |
+| `--skill <skills...>` | Repeatable. Filter to specific skills among those discovered under the path                     |
+| `--all`               | Publish every discovered skill without the interactive multi-select                             |
+| `-y, --yes`           | Skip confirmation prompts                                                                       |
+| `--json`              | Print a machine-readable JSON array instead of human-readable output                            |
+| `--dry-run`           | Discover skills and report what would be created or updated without writing anything            |
+| `--force`             | Overwrite workspace frontmatter that differs from the local skill (see [Conflicts](#conflicts)) |
+
+### Examples
+
+```bash
+# Publish a single skill directory
+npx skills publish ./my-skill --to obvious
+
+# Publish every skill in the current directory
+npx skills publish --to obvious --all
+
+# Publish only the named skills from a tree
+npx skills publish ./skills --to obvious --skill deploy-checklist --skill release-notes
+
+# Preview what would be created or updated
+npx skills publish ./skills --to obvious --dry-run
+
+# Machine-readable output for CI
+npx skills publish ./skills --to obvious --all --json -y
+```
+
+### Output
+
+For each skill, publish prints one `created`, `updated`, or `failed` line, followed by a summary like
+`5 discovered · 4 published · 1 failed`. Failures include the HTTP status and message. With `--json`,
+stdout carries a single JSON array and all other output is suppressed:
+
+```json
+[
+  { "name": "triage-notes", "action": "created", "skillId": "skl_abc" },
+  { "name": "deploy-checklist", "action": "updated", "skillId": "skl_def" },
+  { "name": "broken-skill", "action": "failed", "error": "frontmatter changed in workspace; rerun with --force" }
+]
+```
+
+The exit code is `0` only when every discovered skill published; it is `1` if any skill failed,
+including conflicts aborted in a non-interactive session.
+
+### Authentication
+
+Publish needs an Obvious workspace token, resolved in this order:
+
+1. `OBVIOUS_API_TOKEN` — an explicit token takes precedence and skips login entirely. This is the path for CI and automation.
+2. A cached token from a previous browser login, stored next to the CLI's other configuration.
+3. Browser login — the CLI opens an Obvious session URL and also prints it for headless environments, then waits for the workspace token. The token-issuing endpoint ships in the Obvious backend separately; until it is live, set `OBVIOUS_API_TOKEN`.
+
+`OBVIOUS_API_BASE_URL` overrides the Obvious API base URL (default `https://api.app.obvious.ai`) — used by tests and sandboxes to point publish at a different server.
+
+### Conflicts
+
+The Obvious API rejects updates that change a workspace skill's frontmatter. If the local `name` or `description`
+has drifted from what the workspace holds, publish refuses to overwrite it silently:
+
+- Interactively, publish asks before overwriting.
+- With `-y/--yes` (or in CI), the skill is skipped as `failed` and the run exits `1`; the message points at `--force`.
+- `--force` sends the local frontmatter and overwrites the workspace record.
 
 ## What are Agent Skills?
 
